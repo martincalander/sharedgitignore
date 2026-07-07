@@ -1,0 +1,28 @@
+{
+  "name": "@martincalander/sharedgitignore",
+  "version": "1.0.0",
+  "description": "Minimal CLI for syncing shared managed blocks in .gitignore files.",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "sharedgitignore": "./bin/sharedgitignore.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "gitignore",
+    "ignore",
+    "shared",
+    "cli"
+  ],
+  "license": "UNLICENSED"
+}
