@@ -60,6 +60,10 @@ function expectCliFailure(args, env) {
   throw new Error(`expected CLI failure: ${args.join(" ")}`);
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 test("profile registry stores absolute template paths and validates ids/files", () => {
   const root = tempDir("registry");
   const env = testEnv(root);
@@ -209,6 +213,37 @@ test("sync-all and check-all operate only on repos with managed blocks", () => {
 
   assert.match(runCli(["check-all", "--root", root], env), /ok\tunity\t/);
   assert.equal(fs.readFileSync(path.join(unmanagedRepo, ".gitignore"), "utf8"), "# unmanaged\n");
+});
+
+test("sync-all recurses into nested Git repos by default and can opt out", () => {
+  const root = tempDir("recursive-all");
+  const env = testEnv(root);
+  const templatePath = writeTemplate(root, "unity.shared", "/[Ll]ibrary/\n");
+  addProfile("unity", templatePath, env);
+
+  const parentRepo = path.join(root, "parent");
+  const nestedRepo = path.join(parentRepo, "Packages", "com.example.package");
+  initGitRepo(parentRepo);
+  initGitRepo(nestedRepo);
+  initRepository("unity", { cwd: parentRepo, env });
+  initRepository("unity", { cwd: nestedRepo, env });
+
+  fs.writeFileSync(templatePath, "/[Ll]ibrary/\n/[Tt]emp/\n");
+  const parentRealpath = fs.realpathSync(parentRepo);
+  const nestedRealpath = fs.realpathSync(nestedRepo);
+
+  const recursiveFailure = expectCliFailure(["check-all", "--root", parentRepo], env);
+  assert.match(recursiveFailure.stdout.toString(), new RegExp(`stale\\tunity\\t${escapeRegExp(parentRealpath)}`));
+  assert.match(recursiveFailure.stdout.toString(), new RegExp(`stale\\tunity\\t${escapeRegExp(nestedRealpath)}`));
+
+  const shallowFailure = expectCliFailure(["check-all", "--root", parentRepo, "--no-recursive"], env);
+  assert.match(shallowFailure.stdout.toString(), new RegExp(`stale\\tunity\\t${escapeRegExp(parentRealpath)}`));
+  assert.doesNotMatch(shallowFailure.stdout.toString(), /com\.example\.package/);
+
+  const syncOutput = runCli(["sync-all", "--root", parentRepo], env);
+  assert.match(syncOutput, new RegExp(`updated\\tunity\\t${escapeRegExp(parentRealpath)}`));
+  assert.match(syncOutput, new RegExp(`updated\\tunity\\t${escapeRegExp(nestedRealpath)}`));
+  assert.match(runCli(["check-all", "--root", parentRepo], env), /ok\tunity\t/);
 });
 
 test("repo commands require a real Git repository and known profiles", () => {

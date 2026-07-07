@@ -148,14 +148,14 @@ function shouldSkipDir(name) {
   return new Set([".git", "node_modules", "Library", "Temp", "Obj", "Build", "Builds"]).has(name);
 }
 
-export function findGitRepositories(root) {
+export function findGitRepositories(root, { recursive = true } = {}) {
   const rootPath = path.resolve(root);
   const repositories = [];
 
   function walk(dirPath) {
     if (hasGitDirEntry(dirPath)) {
       repositories.push(dirPath);
-      return;
+      if (!recursive) return;
     }
 
     let entries = [];
@@ -182,9 +182,9 @@ function hasAnyManagedMarker(repoRoot) {
   return content.includes("### BEGIN SHAREDGITIGNORE ") || content.includes(END_MARKER);
 }
 
-export function syncAllRepositories({ root, env = process.env } = {}) {
+export function syncAllRepositories({ root, recursive = true, env = process.env } = {}) {
   if (!root) throw new Error("sync-all requires --root <path>");
-  const repositories = findGitRepositories(root);
+  const repositories = findGitRepositories(root, { recursive });
   const results = [];
 
   for (const repoRoot of repositories) {
@@ -212,9 +212,9 @@ export function syncAllRepositories({ root, env = process.env } = {}) {
   return results;
 }
 
-export function checkAllRepositories({ root, env = process.env } = {}) {
+export function checkAllRepositories({ root, recursive = true, env = process.env } = {}) {
   if (!root) throw new Error("check-all requires --root <path>");
-  const repositories = findGitRepositories(root);
+  const repositories = findGitRepositories(root, { recursive });
   const results = [];
 
   for (const repoRoot of repositories) {

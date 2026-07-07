@@ -59,11 +59,19 @@ sharedgitignore check --cwd /path/to/repo
 ```
 
 Batch commands find Git repos under a root and operate only on repos that
-already contain a sharedgitignore managed block:
+already contain a sharedgitignore managed block. They recurse into nested Git
+repos by default:
 
 ```bash
 sharedgitignore sync-all --root /path/to/repos
 sharedgitignore check-all --root /path/to/repos
+```
+
+Use `--no-recursive` to stop at the first Git repo found in each tree:
+
+```bash
+sharedgitignore sync-all --root /path/to/repos --no-recursive
+sharedgitignore check-all --root /path/to/repos --no-recursive
 ```
 
 ## Command Reference
@@ -78,8 +86,8 @@ sharedgitignore detect [--cwd path] [--json]
 sharedgitignore init --profile <id> [--cwd path]
 sharedgitignore sync [--cwd path]
 sharedgitignore check [--cwd path]
-sharedgitignore sync-all --root <path>
-sharedgitignore check-all --root <path>
+sharedgitignore sync-all --root <path> [--no-recursive]
+sharedgitignore check-all --root <path> [--no-recursive]
 ```
 
 ## Rules

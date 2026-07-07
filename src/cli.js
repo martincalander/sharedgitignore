@@ -188,11 +188,12 @@ Usage:
   sharedgitignore init --profile <id> [--cwd path]
   sharedgitignore sync [--cwd path]
   sharedgitignore check [--cwd path]
-  sharedgitignore sync-all --root <path>
-  sharedgitignore check-all --root <path>
+  sharedgitignore sync-all --root <path> [--no-recursive]
+  sharedgitignore check-all --root <path> [--no-recursive]
 
 sharedgitignore manages a generated shared block at the top of .gitignore.
 Project-specific rules stay below the managed block.
+sync-all and check-all recurse into nested Git repos by default.
 \n`);
 }
 
@@ -248,22 +249,22 @@ export async function main(args, env = process.env) {
   }
 
   if (command === "sync-all") {
-    assertAllowedFlags(flags, ["root"]);
+    assertAllowedFlags(flags, ["root", "no-recursive"]);
     assertNoPositionals(positionals, "sync-all");
     if (!flags.root) throw new Error("sync-all requires --root <path>");
     if (!fs.existsSync(flags.root)) throw new Error(`root does not exist: ${flags.root}`);
-    const results = syncAllRepositories({ root: flags.root, env });
+    const results = syncAllRepositories({ root: flags.root, recursive: !flags["no-recursive"], env });
     printAllResults(results, "sync");
     if (hasFailures(results, "sync")) process.exitCode = 1;
     return;
   }
 
   if (command === "check-all") {
-    assertAllowedFlags(flags, ["root"]);
+    assertAllowedFlags(flags, ["root", "no-recursive"]);
     assertNoPositionals(positionals, "check-all");
     if (!flags.root) throw new Error("check-all requires --root <path>");
     if (!fs.existsSync(flags.root)) throw new Error(`root does not exist: ${flags.root}`);
-    const results = checkAllRepositories({ root: flags.root, env });
+    const results = checkAllRepositories({ root: flags.root, recursive: !flags["no-recursive"], env });
     printAllResults(results, "check");
     if (hasFailures(results, "check")) process.exitCode = 1;
     return;
