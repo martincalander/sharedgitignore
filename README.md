@@ -1,19 +1,50 @@
 # sharedgitignore
 
-`sharedgitignore` is a small CLI for managing a generated shared block at the
-top of each repository's `.gitignore`.
+`sharedgitignore` is a dependency-free CLI for keeping a generated shared block
+at the top of each repository's `.gitignore` while leaving repository-specific
+bytes below that block untouched.
 
-Each repository stays self-contained after clone because the full ignore rules
-are committed in `.gitignore`. The local registry is only needed when running
-`sharedgitignore sync` or `sharedgitignore check`.
+Each repository remains self-contained after cloning because the complete rules
+are committed in `.gitignore`. The local profile registry is needed only when
+running `sync`, `check`, or their batch variants.
 
-## Install
+## Requirements and installation
+
+- Node.js 24 or newer
+- Git on `PATH`
+- zsh only if zsh completion is installed
+
+After the changes are committed and the `v2.0.0` release tag is published,
+install that pinned release directly from GitHub:
 
 ```bash
-npm install -g github:martincalander/sharedgitignore
+npm install -g github:martincalander/sharedgitignore#v2.0.0
+sharedgitignore --version
 ```
 
-## Shared Profiles
+The package is intentionally marked private and unlicensed; it is distributed
+from the tagged Git repository rather than the npm registry.
+
+## Upgrade from v1
+
+Version 2 keeps registry format `version: 1` and managed-block format
+`version=1`. Existing v1 profiles and managed `.gitignore` files therefore need
+no format migration.
+
+Before upgrading, make sure Node 24 or newer is active. After installation, run:
+
+```bash
+sharedgitignore profile status
+sharedgitignore check-all --root /path/to/repos
+```
+
+V2 is deliberately stricter about malformed registry entries, invalid UTF-8
+templates, reserved marker text, ambiguous command-line arguments, symlinks,
+and unreadable batch subtrees. These conditions now fail safely instead of being
+silently accepted. `profile status` exits nonzero if any registered template is
+invalid.
+
+## Profiles
 
 Register a shared template file:
 
@@ -22,23 +53,33 @@ sharedgitignore profile add unity /path/to/unity.gitignore.shared
 sharedgitignore profile status
 ```
 
-Registry state is stored in:
+Profile IDs must match `[a-z0-9][a-z0-9._-]*` exactly. Input is not trimmed.
+Registry state is stored at:
 
 ```text
 ~/.sharedgitignore/registry.json
 ```
 
-Set `SHAREDGITIGNORE_HOME` to use a different registry location.
+Set `SHAREDGITIGNORE_HOME` to use a different registry directory.
 
-## Repo Workflow
+A template must:
 
-Initialize a repo with a managed shared block:
+- be a readable file separate from the destination `.gitignore`;
+- contain valid UTF-8 without a byte-order mark or NUL byte; and
+- contain no line beginning with `### BEGIN SHAREDGITIGNORE` or
+  `### END SHAREDGITIGNORE`.
+
+Registry and template validation happens again before every managed write.
+
+## Repository workflow
+
+Initialize a repository:
 
 ```bash
 sharedgitignore init --profile unity --cwd /path/to/repo
 ```
 
-This prepends a managed block and leaves project-specific rules below it:
+This prepends a managed block and leaves existing repository content below it:
 
 ```gitignore
 ### BEGIN SHAREDGITIGNORE profile=unity version=1 ###
@@ -51,48 +92,130 @@ This prepends a managed block and leaves project-specific rules below it:
 ...project-specific rules...
 ```
 
-Update the shared block later:
+Preview initialization without writing:
 
 ```bash
+sharedgitignore init --profile unity --cwd /path/to/repo --dry-run
+```
+
+Update or verify the managed block later:
+
+```bash
+sharedgitignore sync --cwd /path/to/repo --dry-run
 sharedgitignore sync --cwd /path/to/repo
 sharedgitignore check --cwd /path/to/repo
 ```
 
-Batch commands find Git repos under a root and operate only on repos that
-already contain a sharedgitignore managed block. They recurse into nested Git
-repos by default:
+After initialization, `sync` regenerates only the managed block. Every byte
+after the end marker is preserved, including CRLF and non-UTF-8 project bytes.
+Malformed or duplicate reserved marker lines are rejected before any write.
+
+## Batch workflow
+
+Batch commands discover Git repositories beneath a directory and operate only
+on repositories already containing a sharedgitignore marker:
 
 ```bash
-sharedgitignore sync-all --root /path/to/repos
 sharedgitignore check-all --root /path/to/repos
+sharedgitignore sync-all --root /path/to/repos --dry-run
+sharedgitignore sync-all --root /path/to/repos
 ```
 
-Use `--no-recursive` to stop at the first Git repo found in each tree:
+Discovery completes before mutation. `sync-all` preflights every candidate and
+does not update any repository if traversal diagnostics, malformed blocks,
+unknown profiles, invalid templates, or concurrent preflight changes are found.
+
+The scanner recurses into nested repositories by default. It does not descend
+into `.git`, `node_modules`, `Library`, `Temp`, `Obj`, `Build`, or `Builds`.
+Use `--no-recursive` to stop below the first Git repository found in each tree:
 
 ```bash
-sharedgitignore sync-all --root /path/to/repos --no-recursive
 sharedgitignore check-all --root /path/to/repos --no-recursive
 ```
 
-## Command Reference
+Each individual file replacement is atomic and preserves an existing file's
+mode. A low-level write failure after batch mutation begins can still leave an
+already-written subset updated; the CLI reports the applied count in that case.
+
+## Write safety
+
+- Existing `.gitignore`, registry, and completion destinations must be regular
+  files. Symbolic links and non-files are rejected.
+- Writes use a temporary sibling, flush it, and atomically rename it over the
+  destination.
+- A fully rendered managed block is parsed and verified before publication.
+- `--dry-run` performs validation and planning without writing.
+- Project-specific bytes below the end marker are never regenerated.
+
+## Command-line parsing
+
+Options are typed and must follow their command, and their subcommand when one
+is present. Boolean options do not consume the following positional value,
+value options require a non-empty value, and duplicate options are rejected.
+
+Use `--` to end option parsing when a positional path begins with `--`:
 
 ```bash
+sharedgitignore profile add base -- --template-file
+```
+
+## Command reference
+
+```text
+sharedgitignore --version
+sharedgitignore --help
+
 sharedgitignore profile add <id> <path>
 sharedgitignore profile remove <id>
 sharedgitignore profile list
 sharedgitignore profile status
 
 sharedgitignore detect [--cwd path] [--json]
-sharedgitignore init --profile <id> [--cwd path]
-sharedgitignore sync [--cwd path]
+sharedgitignore init --profile <id> [--cwd path] [--dry-run]
+sharedgitignore sync [--cwd path] [--dry-run]
 sharedgitignore check [--cwd path]
-sharedgitignore sync-all --root <path> [--no-recursive]
+sharedgitignore sync-all --root <path> [--no-recursive] [--dry-run]
 sharedgitignore check-all --root <path> [--no-recursive]
+
+sharedgitignore completion zsh
+sharedgitignore completion install [--dir path]
 ```
 
-## Rules
+`check`, `check-all`, invalid `profile status`, failed batch preflight, and scan
+diagnostics produce a nonzero exit status. Unmanaged repositories found by a
+batch command are reported as `skipped` and are not failures.
 
-- Only `.gitignore` is supported in v1.
-- The shared block must be the first non-empty content in `.gitignore`.
-- Project-specific rules below the end marker are never modified by `sync`.
-- Template files are copied as text; rules are not sorted, deduplicated, or interpreted.
+## Zsh completion
+
+Install the completion file:
+
+```bash
+sharedgitignore completion install
+```
+
+By default it is written to `~/.zsh/completions/_sharedgitignore`. Set
+`SHAREDGITIGNORE_ZSH_COMPLETION_DIR` or pass `--dir` to choose another location.
+Load the directory before `compinit` in `~/.zshrc`:
+
+```zsh
+fpath=("$HOME/.zsh/completions" $fpath)
+autoload -Uz compinit
+compinit
+```
+
+The installer does not edit shell configuration automatically.
+
+## Development
+
+```bash
+npm test
+npm run test:coverage
+npm run check:syntax
+npm run check:zsh
+npm run check:pack
+npm run check
+```
+
+The test suite creates isolated temporary Git repositories and covers parsing,
+registry validation, byte preservation, atomic target safety, dry runs, batch
+preflight, traversal diagnostics, CLI exit codes, and zsh syntax.

@@ -1,9 +1,12 @@
 {
   "name": "@martincalander/sharedgitignore",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Minimal CLI for syncing shared managed blocks in .gitignore files.",
   "private": true,
   "type": "module",
+  "exports": {
+    ".": "./src/sharedgitignore.js"
+  },
   "bin": {
     "sharedgitignore": "./bin/sharedgitignore.js"
   },
@@ -13,10 +16,15 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test"
+    "check": "npm run check:syntax && npm test && npm run check:zsh && npm run check:pack",
+    "check:pack": "npm pack --dry-run --json",
+    "check:syntax": "node --check bin/sharedgitignore.js && node --check src/block.js && node --check src/cli.js && node --check src/completion.js && node --check src/paths.js && node --check src/registry.js && node --check src/repo.js && node --check src/sharedgitignore.js && node --check test/sharedgitignore.test.js",
+    "check:zsh": "node bin/sharedgitignore.js completion zsh | zsh -n",
+    "test": "node --test",
+    "test:coverage": "node --experimental-test-coverage --test"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "keywords": [
     "gitignore",
@@ -24,5 +32,13 @@
     "shared",
     "cli"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/martincalander/sharedgitignore.git"
+  },
+  "bugs": {
+    "url": "https://github.com/martincalander/sharedgitignore/issues"
+  },
+  "homepage": "https://github.com/martincalander/sharedgitignore#readme",
   "license": "UNLICENSED"
 }

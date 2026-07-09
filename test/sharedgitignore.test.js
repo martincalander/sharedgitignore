@@ -6,15 +6,24 @@ import path from "node:path";
 import test from "node:test";
 import {
   addProfile,
+  checkAllRepositories,
   checkRepository,
   detectRepository,
+  findGitRepositories,
+  getProfile,
+  installZshCompletion,
   initRepository,
   listProfiles,
   parseGitignore,
+  parseArgs,
   profileStatus,
+  readRegistry,
+  registryPath,
   removeProfile,
   renderGitignore,
-  syncRepository
+  syncAllRepositories,
+  syncRepository,
+  zshCompletionScript
 } from "../src/sharedgitignore.js";
 
 const BIN = path.resolve("bin/sharedgitignore.js");
@@ -189,6 +198,34 @@ test("CLI detect --json, check exit codes, and profile commands work", () => {
   assert.match(failure.stdout.toString(), /error\tmanaged block is stale/);
 });
 
+test("zsh completion script includes commands, options, and profile lookup", () => {
+  const script = zshCompletionScript();
+
+  assert.match(script, /^#compdef sharedgitignore/);
+  assert.match(script, /'profile:manage shared gitignore profiles'/);
+  assert.match(script, /'completion:print or install shell completions'/);
+  assert.match(script, /compadd -- --root --no-recursive/);
+  assert.match(script, /compadd -- --profile --cwd/);
+  assert.match(script, /sharedgitignore profile list/);
+});
+
+test("completion install writes _sharedgitignore to a zsh completion directory", () => {
+  const root = tempDir("completion-install");
+  const targetDir = path.join(root, "zsh-completions");
+
+  const result = installZshCompletion({ dir: targetDir, env: testEnv(root) });
+  assert.equal(result.shell, "zsh");
+  assert.equal(result.filePath, path.join(targetDir, "_sharedgitignore"));
+  assert.equal(fs.existsSync(result.filePath), true);
+  assert.match(fs.readFileSync(result.filePath, "utf8"), /^#compdef sharedgitignore/);
+
+  assert.equal(
+    runCli(["completion", "install", "--dir", targetDir], testEnv(root)),
+    `zsh\tinstalled\t${result.filePath}\n`
+  );
+  assert.match(runCli(["completion", "zsh"], testEnv(root)), /^#compdef sharedgitignore/);
+});
+
 test("sync-all and check-all operate only on repos with managed blocks", () => {
   const root = tempDir("all");
   const env = testEnv(root);
@@ -265,4 +302,432 @@ test("repo commands require a real Git repository and known profiles", () => {
   const detected = detectRepository({ cwd: repoRoot, env });
   assert.equal(detected.hasBlock, true);
   assert.match(detected.errors.join("\n"), /unknown profile: missing/);
+});
+
+test("v2 CLI parser types flags, rejects ambiguity, and supports --", () => {
+  const parsed = parseArgs(["detect", "--json", "extra"]);
+  assert.equal(parsed.command, "detect");
+  assert.equal(parsed.flags.json, true);
+  assert.deepEqual(parsed.positionals, ["extra"]);
+  assert.equal(Object.getPrototypeOf(parsed.flags), null);
+
+  assert.throws(() => parseArgs(["--json", "detect"]), /options must follow a command/);
+  assert.throws(() => parseArgs(["detect", "--json=true"]), /does not take a value/);
+  assert.throws(() => parseArgs(["detect", "--json", "--json"]), /may not be repeated/);
+  assert.throws(() => parseArgs(["detect", "--cwd"]), /requires a value/);
+  assert.throws(() => parseArgs(["detect", "--cwd="]), /non-empty value/);
+
+  const root = tempDir("strict-cli");
+  const env = testEnv(root);
+  const templateName = "--template";
+  fs.writeFileSync(path.join(root, templateName), "*.tmp\n");
+  assert.match(
+    runCli(["profile", "add", "dash-path", "--", templateName], env, { cwd: root }),
+    /^dash-path\t/
+  );
+
+  const extraFailure = expectCliFailure(["detect", "--json", "extra"], env);
+  assert.match(extraFailure.stderr.toString(), /detect does not accept positional arguments/);
+});
+
+test("CLI version comes from package metadata and requires Node 24", () => {
+  const manifest = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8"));
+  assert.equal(manifest.version, "2.0.0");
+  assert.equal(manifest.engines.node, ">=24");
+  assert.equal(runCli(["--version"], testEnv()), "2.0.0\n");
+  assert.match(runCli(["--help"], testEnv()), /^sharedgitignore 2\.0\.0/);
+});
+
+test("v1 registry and managed-block formats remain compatible", () => {
+  const root = tempDir("v1-migration");
+  const env = testEnv(root);
+  const templatePath = writeTemplate(root, "legacy.shared", "*.tmp\n");
+  fs.mkdirSync(env.SHAREDGITIGNORE_HOME, { recursive: true });
+  fs.writeFileSync(path.join(env.SHAREDGITIGNORE_HOME, "registry.json"), JSON.stringify({
+    version: 1,
+    profiles: { "legacy-": { path: templatePath } }
+  }));
+
+  const repoRoot = path.join(root, "repo");
+  initGitRepo(repoRoot);
+  const projectContent = "# legacy project\n";
+  fs.writeFileSync(
+    path.join(repoRoot, ".gitignore"),
+    renderGitignore("legacy-", "*.tmp\n", projectContent)
+  );
+  assert.equal(checkRepository({ cwd: repoRoot, env }).valid, true);
+
+  fs.writeFileSync(templatePath, "*.tmp\n*.cache\n");
+  syncRepository({ cwd: repoRoot, env });
+  assert.equal(parseGitignore(fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8")).projectContent, projectContent);
+});
+
+test("profile ids and registry entries are strict and prototype-safe", () => {
+  const root = tempDir("strict-registry");
+  const env = testEnv(root);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+
+  assert.equal(getProfile("constructor", env), null);
+  assert.throws(() => addProfile("Upper", templatePath, env), /invalid profile id/);
+  assert.throws(() => addProfile(" base", templatePath, env), /invalid profile id/);
+  assert.throws(() => addProfile("_base", templatePath, env), /invalid profile id/);
+  addProfile("constructor", templatePath, env);
+  assert.equal(getProfile("constructor", env).path, templatePath);
+  assert.equal(Object.getPrototypeOf(readRegistry(env).profiles), null);
+
+  const registryFile = path.join(env.SHAREDGITIGNORE_HOME, "registry.json");
+  fs.writeFileSync(registryFile, JSON.stringify({ version: 1, profiles: { broken: null } }));
+  assert.throws(() => listProfiles(env), /registry profile broken must be an object/);
+
+  fs.writeFileSync(registryFile, JSON.stringify({
+    version: 1,
+    profiles: { Upper: { path: templatePath } }
+  }));
+  assert.throws(() => listProfiles(env), /registry contains invalid profile id/);
+
+  fs.writeFileSync(registryFile, JSON.stringify({
+    version: 1,
+    profiles: { base: { path: "relative.shared" } }
+  }));
+  assert.throws(() => listProfiles(env), /absolute non-empty string/);
+});
+
+test("template registration rejects BOM, NUL, invalid UTF-8, and reserved markers", () => {
+  const root = tempDir("template-content");
+  const env = testEnv(root);
+  const fixtures = [
+    { name: "bom", bytes: Buffer.from([0xef, 0xbb, 0xbf, 0x2a, 0x0a]), error: /byte-order mark/ },
+    { name: "nul", bytes: Buffer.from("*.tmp\u0000\n"), error: /NUL bytes/ },
+    { name: "utf8", bytes: Buffer.from([0xc3, 0x28]), error: /valid UTF-8/ },
+    {
+      name: "marker",
+      bytes: Buffer.from("### END SHAREDGITIGNORE - PROJECT RULES BELOW ###\n"),
+      error: /reserved sharedgitignore marker/
+    },
+    {
+      name: "malformed-marker",
+      bytes: Buffer.from("### BEGIN SHAREDGITIGNORE malformed\n"),
+      error: /reserved sharedgitignore marker/
+    }
+  ];
+
+  for (const fixture of fixtures) {
+    const templatePath = path.join(root, `${fixture.name}.shared`);
+    fs.writeFileSync(templatePath, fixture.bytes);
+    assert.throws(() => addProfile(fixture.name, templatePath, env), fixture.error);
+  }
+});
+
+test("managed writes reject self-referential templates, symlinks, and non-files", () => {
+  const root = tempDir("safe-targets");
+  const env = testEnv(root);
+
+  const selfRepo = path.join(root, "self");
+  initGitRepo(selfRepo);
+  const selfGitignore = path.join(selfRepo, ".gitignore");
+  fs.writeFileSync(selfGitignore, "# local\n");
+  addProfile("self", selfGitignore, env);
+  assert.throws(
+    () => initRepository("self", { cwd: selfRepo, env }),
+    /template must not be the managed \.gitignore/
+  );
+  assert.equal(fs.readFileSync(selfGitignore, "utf8"), "# local\n");
+
+  const templatePath = writeTemplate(root, "safe.shared", "*.tmp\n");
+  addProfile("safe", templatePath, env);
+  const linkRepo = path.join(root, "link");
+  initGitRepo(linkRepo);
+  const linkTarget = path.join(root, "link-target.txt");
+  fs.writeFileSync(linkTarget, "do not touch\n");
+  fs.symlinkSync(linkTarget, path.join(linkRepo, ".gitignore"));
+  assert.throws(
+    () => initRepository("safe", { cwd: linkRepo, env }),
+    /symbolic-link \.gitignore/
+  );
+  assert.equal(fs.readFileSync(linkTarget, "utf8"), "do not touch\n");
+
+  const directoryRepo = path.join(root, "directory");
+  initGitRepo(directoryRepo);
+  fs.mkdirSync(path.join(directoryRepo, ".gitignore"));
+  assert.throws(
+    () => initRepository("safe", { cwd: directoryRepo, env }),
+    /non-file \.gitignore/
+  );
+});
+
+test("registry and completion writes reject destination symlinks", () => {
+  const root = tempDir("atomic-links");
+  const env = testEnv(root);
+  const home = env.SHAREDGITIGNORE_HOME;
+  fs.mkdirSync(home, { recursive: true });
+  const registryTarget = path.join(root, "registry-target.json");
+  const registryContent = `${JSON.stringify({ version: 1, profiles: {} }, null, 2)}\n`;
+  fs.writeFileSync(registryTarget, registryContent);
+  fs.symlinkSync(registryTarget, path.join(home, "registry.json"));
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  assert.throws(() => addProfile("base", templatePath, env), /symbolic-link registry/);
+  assert.equal(fs.readFileSync(registryTarget, "utf8"), registryContent);
+
+  const danglingEnv = testEnv(path.join(root, "dangling-home"));
+  fs.mkdirSync(danglingEnv.SHAREDGITIGNORE_HOME, { recursive: true });
+  fs.symlinkSync(
+    path.join(root, "missing-registry.json"),
+    path.join(danglingEnv.SHAREDGITIGNORE_HOME, "registry.json")
+  );
+  const danglingFailure = expectCliFailure(["profile", "status"], danglingEnv);
+  assert.match(danglingFailure.stderr.toString(), /symbolic-link registry/);
+
+  const completionDir = path.join(root, "completion");
+  fs.mkdirSync(completionDir);
+  const completionTarget = path.join(root, "completion-target");
+  fs.writeFileSync(completionTarget, "keep\n");
+  fs.symlinkSync(completionTarget, path.join(completionDir, "_sharedgitignore"));
+  assert.throws(
+    () => installZshCompletion({ dir: completionDir, env }),
+    /refusing to write symbolic link/
+  );
+  assert.equal(fs.readFileSync(completionTarget, "utf8"), "keep\n");
+});
+
+test("new registry files are private", () => {
+  const root = tempDir("registry-mode");
+  const env = testEnv(root);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+
+  addProfile("base", templatePath, env);
+
+  assert.equal(fs.statSync(registryPath(env)).mode & 0o777, 0o600);
+});
+
+test("sync preserves file mode and every project byte", () => {
+  const root = tempDir("project-bytes");
+  const env = testEnv(root);
+  const repoRoot = path.join(root, "repo");
+  initGitRepo(repoRoot);
+  const templatePath = writeTemplate(root, "bytes.shared", "*.tmp\r\n");
+  addProfile("bytes", templatePath, env);
+
+  const originalProject = Buffer.concat([
+    Buffer.from("# Project CRLF\r\nraw-"),
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from("\r\n")
+  ]);
+  const filePath = path.join(repoRoot, ".gitignore");
+  fs.writeFileSync(filePath, originalProject);
+  fs.chmodSync(filePath, 0o640);
+  initRepository("bytes", { cwd: repoRoot, env });
+
+  let parsed = parseGitignore(fs.readFileSync(filePath));
+  assert.equal(Buffer.isBuffer(parsed.projectContent), true);
+  assert.deepEqual(parsed.projectContent, Buffer.concat([Buffer.from("\n"), originalProject]));
+  assert.equal(fs.statSync(filePath).mode & 0o777, 0o640);
+
+  fs.writeFileSync(templatePath, "*.tmp\r\n*.cache\r\n");
+  const beforeSyncProject = Buffer.from(parsed.projectContent);
+  syncRepository({ cwd: repoRoot, env });
+  parsed = parseGitignore(fs.readFileSync(filePath));
+  assert.deepEqual(parsed.projectContent, beforeSyncProject);
+  assert.equal(fs.statSync(filePath).mode & 0o777, 0o640);
+});
+
+test("malformed reserved marker prefixes are errors and init does not mutate", () => {
+  const malformed = "### BEGIN SHAREDGITIGNORE profile=Upper version=1 ###\n# local\n";
+  assert.match(parseGitignore(malformed).errors.join("\n"), /malformed sharedgitignore begin marker/);
+
+  const root = tempDir("malformed-prefix");
+  const env = testEnv(root);
+  const repoRoot = path.join(root, "repo");
+  initGitRepo(repoRoot);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  addProfile("base", templatePath, env);
+  fs.writeFileSync(path.join(repoRoot, ".gitignore"), malformed);
+  assert.throws(
+    () => initRepository("base", { cwd: repoRoot, env }),
+    /invalid existing \.gitignore managed block/
+  );
+  assert.equal(fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8"), malformed);
+});
+
+test("init and sync dry runs report changes without writing", () => {
+  const root = tempDir("dry-run");
+  const env = testEnv(root);
+  const repoRoot = path.join(root, "repo");
+  initGitRepo(repoRoot);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  addProfile("base", templatePath, env);
+
+  const emptyRepo = path.join(root, "empty-repo");
+  initGitRepo(emptyRepo);
+  const emptyResult = initRepository("base", { cwd: emptyRepo, env, dryRun: true });
+  assert.equal(emptyResult.changed, true);
+  assert.equal(fs.existsSync(path.join(emptyRepo, ".gitignore")), false);
+
+  const filePath = path.join(repoRoot, ".gitignore");
+  fs.writeFileSync(filePath, "# local\n");
+
+  const beforeInit = fs.readFileSync(filePath);
+  const initResult = initRepository("base", { cwd: repoRoot, env, dryRun: true });
+  assert.equal(initResult.changed, true);
+  assert.equal(initResult.applied, false);
+  assert.deepEqual(fs.readFileSync(filePath), beforeInit);
+  assert.match(
+    runCli(["init", "--profile", "base", "--cwd", repoRoot, "--dry-run"], env),
+    /^would-initialize\tbase\t/
+  );
+  assert.deepEqual(fs.readFileSync(filePath), beforeInit);
+
+  initRepository("base", { cwd: repoRoot, env });
+  fs.writeFileSync(templatePath, "*.tmp\n*.cache\n");
+  const beforeSync = fs.readFileSync(filePath);
+  const syncResult = syncRepository({ cwd: repoRoot, env, dryRun: true });
+  assert.equal(syncResult.changed, true);
+  assert.equal(syncResult.applied, false);
+  assert.deepEqual(fs.readFileSync(filePath), beforeSync);
+  assert.match(
+    runCli(["sync", "--cwd", repoRoot, "--dry-run"], env),
+    /^would-update\tbase\t/
+  );
+  assert.deepEqual(fs.readFileSync(filePath), beforeSync);
+});
+
+test("repository discovery validates roots and returns traversal diagnostics", (t) => {
+  const root = tempDir("discovery-diagnostics");
+  const fileRoot = path.join(root, "file");
+  fs.writeFileSync(fileRoot, "x");
+  assert.throws(() => findGitRepositories(path.join(root, "missing")), /root does not exist/);
+  assert.throws(() => findGitRepositories(fileRoot), /root is not a directory/);
+
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    t.skip("permission diagnostics cannot be asserted as root");
+    return;
+  }
+
+  const blocked = path.join(root, "blocked");
+  fs.mkdirSync(blocked);
+  fs.chmodSync(blocked, 0);
+  t.after(() => fs.chmodSync(blocked, 0o700));
+  const discovery = findGitRepositories(root);
+  assert.deepEqual(discovery.repositories, []);
+  assert.equal(discovery.diagnostics.length, 1);
+  assert.equal(discovery.diagnostics[0].path, blocked);
+  assert.match(discovery.diagnostics[0].error, /unable to read directory/);
+});
+
+test("repository discovery diagnoses invalid .git entries instead of skipping them", () => {
+  const root = tempDir("fake-repository");
+  const fakeRepo = path.join(root, "fake");
+  fs.mkdirSync(fakeRepo);
+  fs.writeFileSync(path.join(fakeRepo, ".git"), "not a gitdir\n");
+  fs.writeFileSync(path.join(fakeRepo, ".gitignore"), "# unmanaged\n");
+
+  const discovery = findGitRepositories(root);
+  assert.deepEqual(discovery.repositories, []);
+  assert.equal(discovery.diagnostics.length, 1);
+  assert.equal(discovery.diagnostics[0].path, fakeRepo);
+  assert.match(discovery.diagnostics[0].error, /invalid \.git entry/);
+
+  const failure = expectCliFailure(["check-all", "--root", root], testEnv(root));
+  assert.match(failure.stdout.toString(), /scan-error\t.*invalid \.git entry/);
+});
+
+test("sync-all dry-run writes nothing and reports planned updates", () => {
+  const root = tempDir("batch-dry-run");
+  const env = testEnv(root);
+  const repoRoot = path.join(root, "repo");
+  initGitRepo(repoRoot);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  addProfile("base", templatePath, env);
+  initRepository("base", { cwd: repoRoot, env });
+  fs.writeFileSync(templatePath, "*.tmp\n*.cache\n");
+  const before = fs.readFileSync(path.join(repoRoot, ".gitignore"));
+
+  const batch = syncAllRepositories({ root, env, dryRun: true });
+  assert.equal(batch.aborted, false);
+  assert.equal(batch.appliedCount, 0);
+  assert.equal(batch.results.find((result) => result.repoRoot === fs.realpathSync(repoRoot)).changed, true);
+  assert.deepEqual(fs.readFileSync(path.join(repoRoot, ".gitignore")), before);
+  assert.match(runCli(["sync-all", "--root", root, "--dry-run"], env), /would-update\tbase\t/);
+  assert.deepEqual(fs.readFileSync(path.join(repoRoot, ".gitignore")), before);
+});
+
+test("sync-all completes preflight and aborts all writes when any repo is invalid", () => {
+  const root = tempDir("batch-abort");
+  const env = testEnv(root);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  addProfile("base", templatePath, env);
+
+  const goodRepo = path.join(root, "a-good");
+  const badRepo = path.join(root, "z-bad");
+  initGitRepo(goodRepo);
+  initGitRepo(badRepo);
+  initRepository("base", { cwd: goodRepo, env });
+  fs.writeFileSync(
+    path.join(badRepo, ".gitignore"),
+    "### BEGIN SHAREDGITIGNORE profile=missing version=1 ###\n### END SHAREDGITIGNORE - PROJECT RULES BELOW ###\n"
+  );
+  fs.writeFileSync(templatePath, "*.tmp\n*.cache\n");
+  const beforeGood = fs.readFileSync(path.join(goodRepo, ".gitignore"));
+
+  const batch = syncAllRepositories({ root, env });
+  assert.equal(batch.aborted, true);
+  assert.equal(batch.appliedCount, 0);
+  assert.match(batch.results.find((result) => result.repoRoot === fs.realpathSync(badRepo)).errors[0], /unknown profile/);
+  assert.deepEqual(fs.readFileSync(path.join(goodRepo, ".gitignore")), beforeGood);
+
+  const failure = expectCliFailure(["sync-all", "--root", root], env);
+  assert.match(failure.stdout.toString(), /not-updated\tbase\t/);
+  assert.match(failure.stdout.toString(), /aborted\t.*no repositories updated/);
+  assert.deepEqual(fs.readFileSync(path.join(goodRepo, ".gitignore")), beforeGood);
+});
+
+test("sync-all aborts mutation when discovery reports an unreadable subtree", (t) => {
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    t.skip("permission diagnostics cannot be asserted as root");
+    return;
+  }
+
+  const root = tempDir("batch-scan-abort");
+  const env = testEnv(root);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  addProfile("base", templatePath, env);
+  const repoRoot = path.join(root, "repo");
+  initGitRepo(repoRoot);
+  initRepository("base", { cwd: repoRoot, env });
+  fs.writeFileSync(templatePath, "*.tmp\n*.cache\n");
+  const before = fs.readFileSync(path.join(repoRoot, ".gitignore"));
+  const blocked = path.join(root, "blocked");
+  fs.mkdirSync(blocked);
+  fs.chmodSync(blocked, 0);
+  t.after(() => fs.chmodSync(blocked, 0o700));
+
+  const batch = syncAllRepositories({ root, env });
+  assert.equal(batch.diagnostics.length, 1);
+  assert.equal(batch.aborted, true);
+  assert.equal(batch.appliedCount, 0);
+  assert.deepEqual(fs.readFileSync(path.join(repoRoot, ".gitignore")), before);
+
+  const checked = checkAllRepositories({ root, env });
+  assert.equal(checked.diagnostics.length, 1);
+  const failure = expectCliFailure(["check-all", "--root", root], env);
+  assert.match(failure.stdout.toString(), /scan-error\t/);
+});
+
+test("profile status exits nonzero when a registered template is invalid", () => {
+  const root = tempDir("status-exit");
+  const env = testEnv(root);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  addProfile("base", templatePath, env);
+  fs.rmSync(templatePath);
+
+  const failure = expectCliFailure(["profile", "status"], env);
+  assert.equal(failure.status, 1);
+  assert.match(failure.stdout.toString(), /base\tinvalid: template file does not exist/);
+});
+
+test("zsh completion includes v2 flags and passes zsh syntax checking", () => {
+  const script = zshCompletionScript();
+  assert.match(script, /--help --version/);
+  assert.match(script, /--profile --cwd --dry-run/);
+  assert.match(script, /--root --no-recursive --dry-run/);
+  execFileSync("zsh", ["-n"], { input: script, stdio: ["pipe", "pipe", "pipe"] });
 });

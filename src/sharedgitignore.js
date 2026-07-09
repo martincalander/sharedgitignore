@@ -1,12 +1,18 @@
 export {
+  BEGIN_MARKER_PREFIX,
   beginMarker,
+  END_MARKER_PREFIX,
   END_MARKER,
+  hasReservedMarkerPrefix,
   parseGitignore,
   renderBlock,
-  renderGitignore
+  renderGitignore,
+  renderGitignoreBuffer,
+  validateTemplateContent
 } from "./block.js";
 
 export {
+  atomicWriteFile,
   gitignorePath,
   PROFILE_ID_PATTERN,
   readJsonFile,
@@ -38,6 +44,12 @@ export {
   syncAllRepositories,
   syncRepository
 } from "./repo.js";
+
+export {
+  defaultZshCompletionDir,
+  installZshCompletion,
+  zshCompletionScript
+} from "./completion.js";
 
 export {
   main,

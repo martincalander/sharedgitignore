@@ -1,4 +1,5 @@
-import fs from "node:fs";
+import packageJson from "../package.json" with { type: "json" };
+import { installZshCompletion, zshCompletionScript } from "./completion.js";
 import {
   addProfile,
   listProfiles,
@@ -14,44 +15,128 @@ import {
   syncRepository
 } from "./repo.js";
 
+const VERSION = packageJson.version;
+const BOOLEAN_OPTION = Object.freeze({ type: "boolean", repeatable: false });
+const VALUE_OPTION = Object.freeze({ type: "string", repeatable: false });
+
+const COMMAND_OPTIONS = Object.freeze({
+  help: {},
+  profile: {
+    add: {},
+    remove: {},
+    list: {},
+    status: {}
+  },
+  completion: {
+    zsh: {},
+    install: { dir: VALUE_OPTION }
+  },
+  detect: { cwd: VALUE_OPTION, json: BOOLEAN_OPTION },
+  init: { cwd: VALUE_OPTION, profile: VALUE_OPTION, "dry-run": BOOLEAN_OPTION },
+  sync: { cwd: VALUE_OPTION, "dry-run": BOOLEAN_OPTION },
+  check: { cwd: VALUE_OPTION },
+  "sync-all": { root: VALUE_OPTION, "no-recursive": BOOLEAN_OPTION, "dry-run": BOOLEAN_OPTION },
+  "check-all": { root: VALUE_OPTION, "no-recursive": BOOLEAN_OPTION }
+});
+
+function optionDefinitions(command, subcommand) {
+  const commandDefinition = COMMAND_OPTIONS[command];
+  let definitions = commandDefinition ?? {};
+  if (["profile", "completion"].includes(command)) {
+    definitions = subcommand && Object.hasOwn(commandDefinition, subcommand)
+      ? commandDefinition[subcommand]
+      : {};
+  }
+  return { ...definitions, help: BOOLEAN_OPTION };
+}
+
+function parseOptionToken(token) {
+  const equalsIndex = token.indexOf("=");
+  if (equalsIndex === -1) return { name: token.slice(2), inlineValue: undefined };
+  return {
+    name: token.slice(2, equalsIndex),
+    inlineValue: token.slice(equalsIndex + 1)
+  };
+}
+
 export function parseArgs(args) {
-  const flags = {};
-  const positionals = [];
-
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-    if (!arg.startsWith("--")) {
-      positionals.push(arg);
-      continue;
-    }
-
-    const [rawKey, inlineValue] = arg.slice(2).split("=", 2);
-    if (inlineValue !== undefined) {
-      flags[rawKey] = inlineValue;
-      continue;
-    }
-
-    const next = args[index + 1];
-    if (next && !next.startsWith("--")) {
-      flags[rawKey] = next;
-      index += 1;
-    } else {
-      flags[rawKey] = true;
-    }
+  if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) {
+    throw new TypeError("arguments must be an array of strings");
+  }
+  if (args.length === 0) {
+    return { command: "help", subcommand: null, flags: Object.create(null), positionals: [] };
+  }
+  if (args[0] === "--version") {
+    if (args.length !== 1) throw new Error("--version does not accept additional arguments");
+    return { command: "version", subcommand: null, flags: Object.create(null), positionals: [] };
+  }
+  if (args[0] === "--help") {
+    if (args.length !== 1) throw new Error("--help does not accept additional arguments before a command");
+    return { command: "help", subcommand: null, flags: Object.create(null), positionals: [] };
+  }
+  if (args[0].startsWith("--")) {
+    throw new Error(`options must follow a command: ${args[0]}`);
   }
 
-  return { flags, positionals };
+  const command = args[0];
+  let index = 1;
+  let subcommand = null;
+  if (["profile", "completion"].includes(command) && args[index] && !args[index].startsWith("--")) {
+    subcommand = args[index];
+    index += 1;
+  }
+
+  const definitions = optionDefinitions(command, subcommand);
+  const flags = Object.create(null);
+  const positionals = [];
+  let optionsEnded = false;
+
+  while (index < args.length) {
+    const token = args[index];
+    if (!optionsEnded && token === "--") {
+      optionsEnded = true;
+      index += 1;
+      continue;
+    }
+    if (optionsEnded || !token.startsWith("--")) {
+      positionals.push(token);
+      index += 1;
+      continue;
+    }
+
+    const { name, inlineValue } = parseOptionToken(token);
+    if (!name || !Object.hasOwn(definitions, name)) throw new Error(`Unknown option: --${name}`);
+    const definition = definitions[name];
+    if (Object.hasOwn(flags, name) && !definition.repeatable) {
+      throw new Error(`Option may not be repeated: --${name}`);
+    }
+
+    if (definition.type === "boolean") {
+      if (inlineValue !== undefined) throw new Error(`Option does not take a value: --${name}`);
+      flags[name] = true;
+      index += 1;
+      continue;
+    }
+
+    let value = inlineValue;
+    if (value === undefined) {
+      const candidate = args[index + 1];
+      if (candidate === undefined || candidate === "--" || candidate.startsWith("--")) {
+        throw new Error(`Option requires a value: --${name}`);
+      }
+      value = candidate;
+      index += 1;
+    }
+    if (value.length === 0) throw new Error(`Option requires a non-empty value: --${name}`);
+    flags[name] = definition.repeatable ? [...(flags[name] ?? []), value] : value;
+    index += 1;
+  }
+
+  return { command, subcommand, flags, positionals };
 }
 
 function printJson(value) {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-}
-
-function assertAllowedFlags(flags, allowed) {
-  const allowedSet = new Set(allowed);
-  for (const flag of Object.keys(flags)) {
-    if (!allowedSet.has(flag)) throw new Error(`Unknown option: --${flag}`);
-  }
 }
 
 function assertNoPositionals(positionals, label) {
@@ -73,17 +158,17 @@ function printProfileStatus(env) {
   const statuses = profileStatus(env);
   if (statuses.length === 0) {
     process.stdout.write("no profiles registered\n");
-    return;
+    return true;
   }
   for (const profile of statuses) {
     const state = profile.valid ? "ok" : `invalid: ${profile.errors.join("; ")}`;
     process.stdout.write(`${profile.id}\t${state}\t${profile.path}\n`);
   }
+  return statuses.every((profile) => profile.valid);
 }
 
 function handleProfileCommand(subcommand, flags, positionals, env) {
   if (subcommand === "add") {
-    assertAllowedFlags(flags, []);
     const id = positionals[0];
     const templatePath = positionals[1];
     if (!id || !templatePath) throw new Error("profile add requires <id> <path>");
@@ -94,7 +179,6 @@ function handleProfileCommand(subcommand, flags, positionals, env) {
   }
 
   if (subcommand === "remove") {
-    assertAllowedFlags(flags, []);
     const id = positionals[0];
     if (!id) throw new Error("profile remove requires <id>");
     if (positionals.length > 1) throw new Error("profile remove accepts exactly <id>");
@@ -104,20 +188,35 @@ function handleProfileCommand(subcommand, flags, positionals, env) {
   }
 
   if (subcommand === "list") {
-    assertAllowedFlags(flags, []);
     assertNoPositionals(positionals, "profile list");
     printProfileList(env);
     return;
   }
 
   if (subcommand === "status") {
-    assertAllowedFlags(flags, []);
     assertNoPositionals(positionals, "profile status");
-    printProfileStatus(env);
+    if (!printProfileStatus(env)) process.exitCode = 1;
     return;
   }
 
   throw new Error(`Unknown profile command: ${subcommand || "(missing)"}`);
+}
+
+function handleCompletionCommand(subcommand, flags, positionals, env) {
+  if (subcommand === "zsh") {
+    assertNoPositionals(positionals, "completion zsh");
+    process.stdout.write(zshCompletionScript());
+    return;
+  }
+
+  if (subcommand === "install") {
+    assertNoPositionals(positionals, "completion install");
+    const result = installZshCompletion({ dir: flags.dir, env });
+    process.stdout.write(`${result.shell}\tinstalled\t${result.filePath}\n`);
+    return;
+  }
+
+  throw new Error(`Unknown completion command: ${subcommand || "(missing)"}`);
 }
 
 function printDetect(result) {
@@ -143,8 +242,12 @@ function printCheckResult(result) {
   }
 }
 
-function printAllResults(results, mode) {
-  for (const result of results) {
+function printAllResults(batch, mode) {
+  for (const diagnostic of batch.diagnostics) {
+    process.stdout.write(`scan-error\t${diagnostic.path}\t${diagnostic.error}\n`);
+  }
+
+  for (const result of batch.results) {
     if (result.skipped) {
       process.stdout.write(`skipped\t${result.repoRoot}\t${result.reason}\n`);
       continue;
@@ -161,15 +264,28 @@ function printAllResults(results, mode) {
     }
 
     if (mode === "sync") {
-      process.stdout.write(`${result.changed ? "updated" : "current"}\t${result.profile}\t${result.repoRoot}\n`);
+      let state = "current";
+      if (result.changed && result.applied) state = "updated";
+      else if (result.changed && batch.dryRun) state = "would-update";
+      else if (result.changed && batch.aborted) state = "not-updated";
+      process.stdout.write(`${state}\t${result.profile}\t${result.repoRoot}\n`);
     } else {
       process.stdout.write(`${result.valid ? "ok" : "stale"}\t${result.profile}\t${result.repoRoot}\n`);
     }
   }
+
+  if (mode === "sync" && batch.aborted) {
+    const detail = batch.appliedCount === 0
+      ? "no repositories updated"
+      : `${batch.appliedCount} repositories updated before failure`;
+    process.stdout.write(`aborted\t${batch.root}\t${detail}\n`);
+  }
 }
 
-function hasFailures(results, mode) {
-  return results.some((result) => {
+function hasFailures(batch, mode) {
+  if (batch.diagnostics.length > 0) return true;
+  if (mode === "sync" && batch.aborted) return true;
+  return batch.results.some((result) => {
     if (result.skipped) return false;
     if (result.errors && result.errors.length > 0) return true;
     return mode === "check" && !result.valid;
@@ -177,44 +293,56 @@ function hasFailures(results, mode) {
 }
 
 function help() {
-  process.stdout.write(`sharedgitignore 1.0.0
+  process.stdout.write(`sharedgitignore ${VERSION}
 
 Usage:
+  sharedgitignore --version
   sharedgitignore profile add <id> <path>
   sharedgitignore profile remove <id>
   sharedgitignore profile list
   sharedgitignore profile status
   sharedgitignore detect [--cwd path] [--json]
-  sharedgitignore init --profile <id> [--cwd path]
-  sharedgitignore sync [--cwd path]
+  sharedgitignore init --profile <id> [--cwd path] [--dry-run]
+  sharedgitignore sync [--cwd path] [--dry-run]
   sharedgitignore check [--cwd path]
-  sharedgitignore sync-all --root <path> [--no-recursive]
+  sharedgitignore sync-all --root <path> [--no-recursive] [--dry-run]
   sharedgitignore check-all --root <path> [--no-recursive]
+  sharedgitignore completion zsh
+  sharedgitignore completion install [--dir path]
+
+Options must follow their command (and subcommand, where present).
+Use -- to end option parsing for positional IDs or paths.
 
 sharedgitignore manages a generated shared block at the top of .gitignore.
-Project-specific rules stay below the managed block.
+Project-specific bytes stay below the managed block.
 sync-all and check-all recurse into nested Git repos by default.
 \n`);
 }
 
 export async function main(args, env = process.env) {
-  const { flags, positionals } = parseArgs(args);
-  const command = positionals.shift() || "help";
+  const { command, subcommand, flags, positionals } = parseArgs(args);
 
+  if (command === "version") {
+    process.stdout.write(`${VERSION}\n`);
+    return;
+  }
   if (flags.help || command === "help") {
-    assertAllowedFlags(flags, ["help"]);
     assertNoPositionals(positionals, "help");
     help();
     return;
   }
 
   if (command === "profile") {
-    handleProfileCommand(positionals.shift(), flags, positionals, env);
+    handleProfileCommand(subcommand, flags, positionals, env);
+    return;
+  }
+
+  if (command === "completion") {
+    handleCompletionCommand(subcommand, flags, positionals, env);
     return;
   }
 
   if (command === "detect") {
-    assertAllowedFlags(flags, ["cwd", "json"]);
     assertNoPositionals(positionals, "detect");
     const result = detectRepository({ cwd: flags.cwd || process.cwd(), env });
     if (flags.json) printJson(result);
@@ -223,24 +351,31 @@ export async function main(args, env = process.env) {
   }
 
   if (command === "init") {
-    assertAllowedFlags(flags, ["cwd", "profile"]);
     assertNoPositionals(positionals, "init");
     if (!flags.profile) throw new Error("init requires --profile <id>");
-    const result = initRepository(flags.profile, { cwd: flags.cwd || process.cwd(), env });
-    process.stdout.write(`${result.changed ? "initialized" : "current"}\t${result.profile}\t${result.gitignorePath}\n`);
+    const result = initRepository(flags.profile, {
+      cwd: flags.cwd || process.cwd(),
+      env,
+      dryRun: flags["dry-run"] === true
+    });
+    const state = result.changed ? (result.dryRun ? "would-initialize" : "initialized") : "current";
+    process.stdout.write(`${state}\t${result.profile}\t${result.gitignorePath}\n`);
     return;
   }
 
   if (command === "sync") {
-    assertAllowedFlags(flags, ["cwd"]);
     assertNoPositionals(positionals, "sync");
-    const result = syncRepository({ cwd: flags.cwd || process.cwd(), env });
-    process.stdout.write(`${result.changed ? "updated" : "current"}\t${result.profile}\t${result.gitignorePath}\n`);
+    const result = syncRepository({
+      cwd: flags.cwd || process.cwd(),
+      env,
+      dryRun: flags["dry-run"] === true
+    });
+    const state = result.changed ? (result.dryRun ? "would-update" : "updated") : "current";
+    process.stdout.write(`${state}\t${result.profile}\t${result.gitignorePath}\n`);
     return;
   }
 
   if (command === "check") {
-    assertAllowedFlags(flags, ["cwd"]);
     assertNoPositionals(positionals, "check");
     const result = checkRepository({ cwd: flags.cwd || process.cwd(), env });
     printCheckResult(result);
@@ -249,24 +384,29 @@ export async function main(args, env = process.env) {
   }
 
   if (command === "sync-all") {
-    assertAllowedFlags(flags, ["root", "no-recursive"]);
     assertNoPositionals(positionals, "sync-all");
     if (!flags.root) throw new Error("sync-all requires --root <path>");
-    if (!fs.existsSync(flags.root)) throw new Error(`root does not exist: ${flags.root}`);
-    const results = syncAllRepositories({ root: flags.root, recursive: !flags["no-recursive"], env });
-    printAllResults(results, "sync");
-    if (hasFailures(results, "sync")) process.exitCode = 1;
+    const batch = syncAllRepositories({
+      root: flags.root,
+      recursive: !flags["no-recursive"],
+      dryRun: flags["dry-run"] === true,
+      env
+    });
+    printAllResults(batch, "sync");
+    if (hasFailures(batch, "sync")) process.exitCode = 1;
     return;
   }
 
   if (command === "check-all") {
-    assertAllowedFlags(flags, ["root", "no-recursive"]);
     assertNoPositionals(positionals, "check-all");
     if (!flags.root) throw new Error("check-all requires --root <path>");
-    if (!fs.existsSync(flags.root)) throw new Error(`root does not exist: ${flags.root}`);
-    const results = checkAllRepositories({ root: flags.root, recursive: !flags["no-recursive"], env });
-    printAllResults(results, "check");
-    if (hasFailures(results, "check")) process.exitCode = 1;
+    const batch = checkAllRepositories({
+      root: flags.root,
+      recursive: !flags["no-recursive"],
+      env
+    });
+    printAllResults(batch, "check");
+    if (hasFailures(batch, "check")) process.exitCode = 1;
     return;
   }
 
