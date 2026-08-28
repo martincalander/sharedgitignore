@@ -16,12 +16,12 @@
     "README.md"
   ],
   "scripts": {
-    "check": "npm run check:syntax && npm test && npm run check:zsh && npm run check:pack",
+    "check": "npm run check:syntax && npm run test:coverage && npm run check:zsh && npm run check:pack",
     "check:pack": "npm pack --dry-run --json",
     "check:syntax": "node --check bin/sharedgitignore.js && node --check src/block.js && node --check src/cli.js && node --check src/completion.js && node --check src/paths.js && node --check src/registry.js && node --check src/repo.js && node --check src/sharedgitignore.js && node --check test/sharedgitignore.test.js",
     "check:zsh": "node bin/sharedgitignore.js completion zsh | zsh -n",
     "test": "node --test",
-    "test:coverage": "node --experimental-test-coverage --test"
+    "test:coverage": "node --experimental-test-coverage --test-coverage-include-all --test-coverage-lines=90 --test-coverage-branches=75 --test-coverage-functions=90 --test"
   },
   "engines": {
     "node": ">=24"

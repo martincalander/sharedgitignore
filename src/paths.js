@@ -33,10 +33,34 @@ function destinationMode(filePath) {
   }
 }
 
-export function atomicWriteFile(filePath, content, { mode = 0o666 } = {}) {
+function flushDirectoryBestEffort(dirPath) {
+  let descriptor = null;
+  try {
+    descriptor = fs.openSync(dirPath, "r");
+    fs.fsyncSync(descriptor);
+  } catch {
+    // Some platforms and filesystems do not support opening or syncing directories.
+  } finally {
+    if (descriptor !== null) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        // The file replacement has already completed.
+      }
+    }
+  }
+}
+
+export function atomicWriteFile(filePath, content, {
+  beforeRename = null,
+  mode = 0o666,
+  createParent = true,
+  preserveMode = true
+} = {}) {
   const parent = path.dirname(filePath);
-  ensureDir(parent);
+  if (createParent) ensureDir(parent);
   const existingMode = destinationMode(filePath);
+  const outputMode = existingMode !== null && preserveMode ? existingMode : mode;
   const temporaryPath = path.join(
     parent,
     `.${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`
@@ -44,13 +68,18 @@ export function atomicWriteFile(filePath, content, { mode = 0o666 } = {}) {
   let descriptor = null;
 
   try {
-    descriptor = fs.openSync(temporaryPath, "wx", existingMode ?? mode);
+    descriptor = fs.openSync(temporaryPath, "wx", outputMode);
     fs.writeFileSync(descriptor, content);
-    if (existingMode !== null) fs.fchmodSync(descriptor, existingMode);
+    if (existingMode !== null || !preserveMode) fs.fchmodSync(descriptor, outputMode);
     fs.fsyncSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = null;
+    if (beforeRename !== null) beforeRename();
+    if (destinationMode(filePath) !== existingMode) {
+      throw new Error(`destination mode or existence changed during atomic write: ${filePath}`);
+    }
     fs.renameSync(temporaryPath, filePath);
+    flushDirectoryBestEffort(parent);
   } catch (error) {
     if (descriptor !== null) {
       try {
@@ -69,7 +98,10 @@ export function atomicWriteFile(filePath, content, { mode = 0o666 } = {}) {
 }
 
 export function writeJsonFile(filePath, value) {
-  atomicWriteFile(filePath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  atomicWriteFile(filePath, `${JSON.stringify(value, null, 2)}\n`, {
+    mode: 0o600,
+    preserveMode: false
+  });
 }
 
 function homeDir() {
@@ -84,18 +116,68 @@ export function registryPath(env = process.env) {
   return path.join(sharedgitignoreHome(env), "registry.json");
 }
 
+function childProcessErrorMessage(error) {
+  if (!error || typeof error !== "object") return "";
+  const stderr = typeof error.stderr === "string"
+    ? error.stderr
+    : (Buffer.isBuffer(error.stderr) ? error.stderr.toString("utf8") : "");
+  return stderr.trim();
+}
+
+function isSameOrDescendant(parentPath, candidatePath) {
+  const relative = path.relative(parentPath, candidatePath);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function parseGitRepositoryRoot(output, cwd) {
+  if (typeof output !== "string" || !output.endsWith("\n")) {
+    throw new Error(`Git returned an invalid repository root for: ${cwd}`);
+  }
+
+  const withoutLineFeed = output.slice(0, -1);
+  const candidates = [withoutLineFeed];
+  if (withoutLineFeed.endsWith("\r")) candidates.push(withoutLineFeed.slice(0, -1));
+
+  let realCwd;
+  try {
+    realCwd = fs.realpathSync(cwd);
+  } catch (error) {
+    const detail = error && typeof error === "object" && error.code ? ` (${error.code})` : "";
+    throw new Error(`cannot resolve repository path: ${cwd}${detail}`);
+  }
+
+  for (const candidate of candidates) {
+    if (candidate.length === 0) continue;
+    try {
+      const resolvedCandidate = path.resolve(candidate);
+      const stat = fs.statSync(resolvedCandidate);
+      if (!stat.isDirectory()) continue;
+      const realCandidate = fs.realpathSync(resolvedCandidate);
+      if (isSameOrDescendant(realCandidate, realCwd)) return realCandidate;
+    } catch {
+      // A CRLF alternative or a concurrently removed path may not exist.
+    }
+  }
+
+  throw new Error(`Git returned a repository root that does not contain: ${cwd}`);
+}
+
 export function repoRootForCwd(cwd = process.cwd()) {
   const resolved = path.resolve(cwd);
+  let output;
   try {
-    const output = execFileSync("git", ["-C", resolved, "rev-parse", "--show-toplevel"], {
+    output = execFileSync("git", ["-C", resolved, "rev-parse", "--show-toplevel"], {
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    }).trim();
-    if (!output) throw new Error("empty git output");
-    return path.resolve(output);
-  } catch {
-    throw new Error(`not a Git repository: ${resolved}`);
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") {
+      throw new Error("Git is required but was not found on PATH");
+    }
+    const detail = childProcessErrorMessage(error);
+    throw new Error(`not a Git repository: ${resolved}${detail ? `: ${detail}` : ""}`);
   }
+  return parseGitRepositoryRoot(output, resolved);
 }
 
 export function gitignorePath(repoRoot) {

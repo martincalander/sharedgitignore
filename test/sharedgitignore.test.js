@@ -1,9 +1,10 @@
 import assert from "node:assert";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import {
   addProfile,
   checkAllRepositories,
@@ -21,12 +22,14 @@ import {
   registryPath,
   removeProfile,
   renderGitignore,
+  repoRootForCwd,
   syncAllRepositories,
   syncRepository,
   zshCompletionScript
 } from "../src/sharedgitignore.js";
 
 const BIN = path.resolve("bin/sharedgitignore.js");
+const execFileAsync = promisify(execFile);
 
 function tempDir(name) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `sharedgitignore-${name}-`));
@@ -96,6 +99,61 @@ test("profile registry stores absolute template paths and validates ids/files", 
   assert.equal(removeProfile("unity", env), true);
   assert.equal(removeProfile("unity", env), false);
   assert.deepEqual(listProfiles(env), []);
+});
+
+test("concurrent profile additions preserve every successful update", async () => {
+  const root = tempDir("registry-concurrency");
+  const env = testEnv(root);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  const profileIds = Array.from({ length: 32 }, (_, index) => `profile-${index.toString().padStart(2, "0")}`);
+
+  await Promise.all(profileIds.map((profileId) => execFileAsync(
+    process.execPath,
+    [BIN, "profile", "add", profileId, templatePath],
+    {
+      cwd: path.dirname(BIN),
+      env,
+      encoding: "utf8",
+      timeout: 15_000
+    }
+  )));
+
+  assert.deepEqual(listProfiles(env).map((profile) => profile.id), profileIds);
+  assert.equal(fs.existsSync(`${registryPath(env)}.lock`), false);
+});
+
+test("concurrent profile additions and removals remain serialized", async () => {
+  const root = tempDir("registry-mixed-concurrency");
+  const env = testEnv(root);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  const removedIds = Array.from({ length: 16 }, (_, index) => `removed-${index.toString().padStart(2, "0")}`);
+  const addedIds = Array.from({ length: 16 }, (_, index) => `added-${index.toString().padStart(2, "0")}`);
+  for (const profileId of removedIds) addProfile(profileId, templatePath, env);
+
+  const additions = addedIds.map((profileId) => execFileAsync(
+    process.execPath,
+    [BIN, "profile", "add", profileId, templatePath],
+    {
+      cwd: path.dirname(BIN),
+      env,
+      encoding: "utf8",
+      timeout: 15_000
+    }
+  ));
+  const removals = removedIds.map((profileId) => execFileAsync(
+    process.execPath,
+    [BIN, "profile", "remove", profileId],
+    {
+      cwd: path.dirname(BIN),
+      env,
+      encoding: "utf8",
+      timeout: 15_000
+    }
+  ));
+  await Promise.all([...additions, ...removals]);
+
+  assert.deepEqual(listProfiles(env).map((profile) => profile.id), addedIds);
+  assert.equal(fs.existsSync(`${registryPath(env)}.lock`), false);
 });
 
 test("parser validates managed block markers and preserves project content", () => {
@@ -304,6 +362,40 @@ test("repo commands require a real Git repository and known profiles", () => {
   assert.match(detected.errors.join("\n"), /unknown profile: missing/);
 });
 
+test("repository diagnostics distinguish a missing Git executable", () => {
+  const originalPath = process.env.PATH;
+  process.env.PATH = "";
+  try {
+    assert.throws(() => repoRootForCwd(process.cwd()), /Git is required but was not found on PATH/);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+  }
+});
+
+test("repository roots preserve trailing whitespace in directory names", (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows does not consistently preserve trailing whitespace in directory names");
+    return;
+  }
+
+  const root = tempDir("repository-whitespace");
+  const env = testEnv(root);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  addProfile("base", templatePath, env);
+
+  for (const name of ["repo ", "repo\t", "repo\n"]) {
+    const repository = path.join(root, name);
+    initGitRepo(repository);
+    const expectedRoot = fs.realpathSync(repository);
+
+    assert.equal(repoRootForCwd(repository), expectedRoot);
+    initRepository("base", { cwd: repository, env });
+    assert.equal(fs.existsSync(path.join(repository, ".gitignore")), true);
+    assert.equal(fs.existsSync(path.join(root, name.slice(0, -1), ".gitignore")), false);
+  }
+});
+
 test("v2 CLI parser types flags, rejects ambiguity, and supports --", () => {
   const parsed = parseArgs(["detect", "--json", "extra"]);
   assert.equal(parsed.command, "detect");
@@ -489,13 +581,16 @@ test("registry and completion writes reject destination symlinks", () => {
   assert.equal(fs.readFileSync(completionTarget, "utf8"), "keep\n");
 });
 
-test("new registry files are private", () => {
+test("registry writes create and retain private permissions", () => {
   const root = tempDir("registry-mode");
   const env = testEnv(root);
   const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
 
   addProfile("base", templatePath, env);
+  assert.equal(fs.statSync(registryPath(env)).mode & 0o777, 0o600);
 
+  fs.chmodSync(registryPath(env), 0o644);
+  addProfile("second", templatePath, env);
   assert.equal(fs.statSync(registryPath(env)).mode & 0o777, 0o600);
 });
 
@@ -512,7 +607,7 @@ test("sync preserves file mode and every project byte", () => {
     Buffer.from([0xff, 0xfe]),
     Buffer.from("\r\n")
   ]);
-  const filePath = path.join(repoRoot, ".gitignore");
+  const filePath = path.join(fs.realpathSync(repoRoot), ".gitignore");
   fs.writeFileSync(filePath, originalProject);
   fs.chmodSync(filePath, 0o640);
   initRepository("bytes", { cwd: repoRoot, env });
@@ -528,6 +623,225 @@ test("sync preserves file mode and every project byte", () => {
   parsed = parseGitignore(fs.readFileSync(filePath));
   assert.deepEqual(parsed.projectContent, beforeSyncProject);
   assert.equal(fs.statSync(filePath).mode & 0o777, 0o640);
+});
+
+test("managed CRLF and LF line endings compare as equivalent", () => {
+  const root = tempDir("managed-crlf");
+  const env = testEnv(root);
+  const repoRoot = path.join(root, "repo");
+  initGitRepo(repoRoot);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n*.cache\n");
+  addProfile("base", templatePath, env);
+  fs.writeFileSync(path.join(repoRoot, ".gitignore"), "# project\r\n/local\r\n");
+  initRepository("base", { cwd: repoRoot, env });
+
+  const filePath = path.join(fs.realpathSync(repoRoot), ".gitignore");
+  const initialized = fs.readFileSync(filePath);
+  const parsed = parseGitignore(initialized);
+  const managedLength = initialized.length - parsed.projectContent.length;
+  const managedWithCrlf = Buffer.from(
+    initialized.subarray(0, managedLength).toString("latin1").replaceAll("\n", "\r\n"),
+    "latin1"
+  );
+  const converted = Buffer.concat([managedWithCrlf, parsed.projectContent]);
+  fs.writeFileSync(filePath, converted);
+
+  assert.equal(checkRepository({ cwd: repoRoot, env }).valid, true);
+  const synced = syncRepository({ cwd: repoRoot, env });
+  assert.equal(synced.changed, false);
+  assert.deepEqual(fs.readFileSync(filePath), converted);
+
+  fs.writeFileSync(templatePath, "*.tmp\n*.cache\n*.logs\n");
+  assert.deepEqual(checkRepository({ cwd: repoRoot, env }).errors, ["managed block is stale"]);
+});
+
+test("single-repository writes revalidate the template immediately before replacement", () => {
+  const root = tempDir("template-race");
+  const env = testEnv(root);
+  const repoRoot = path.join(root, "repo");
+  initGitRepo(repoRoot);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  addProfile("base", templatePath, env);
+  initRepository("base", { cwd: repoRoot, env });
+
+  const filePath = path.join(fs.realpathSync(repoRoot), ".gitignore");
+  const originalGitignore = fs.readFileSync(filePath);
+  fs.writeFileSync(templatePath, "*.tmp\n*.cache\n");
+
+  const originalReadFileSync = fs.readFileSync;
+  let gitignoreReads = 0;
+  fs.readFileSync = function patchedReadFileSync(target, ...args) {
+    if (target === filePath) {
+      gitignoreReads += 1;
+      if (gitignoreReads === 2) fs.writeFileSync(templatePath, "*.tmp\n*.logs\n");
+    }
+    return Reflect.apply(originalReadFileSync, fs, [target, ...args]);
+  };
+
+  try {
+    assert.throws(
+      () => syncRepository({ cwd: repoRoot, env }),
+      /template changed during planning/
+    );
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  assert.deepEqual(fs.readFileSync(filePath), originalGitignore);
+});
+
+test("single-repository writes recheck .gitignore after flushing the temporary file", () => {
+  const root = tempDir("commit-race");
+  const env = testEnv(root);
+  const repoRoot = path.join(root, "repo");
+  initGitRepo(repoRoot);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  addProfile("base", templatePath, env);
+  initRepository("base", { cwd: repoRoot, env });
+
+  const filePath = path.join(fs.realpathSync(repoRoot), ".gitignore");
+  const before = fs.readFileSync(filePath);
+  const concurrentEdit = Buffer.from("# edit during replacement\n");
+  fs.writeFileSync(templatePath, "*.tmp\n*.cache\n");
+
+  const originalFsyncSync = fs.fsyncSync;
+  let editInjected = false;
+  fs.fsyncSync = function patchedFsyncSync(descriptor) {
+    const result = Reflect.apply(originalFsyncSync, fs, [descriptor]);
+    if (!editInjected) {
+      fs.appendFileSync(filePath, concurrentEdit);
+      editInjected = true;
+    }
+    return result;
+  };
+
+  try {
+    assert.throws(
+      () => syncRepository({ cwd: repoRoot, env }),
+      /\.gitignore changed during planning commit/
+    );
+  } finally {
+    fs.fsyncSync = originalFsyncSync;
+  }
+
+  assert.equal(editInjected, true);
+  assert.deepEqual(fs.readFileSync(filePath), Buffer.concat([before, concurrentEdit]));
+});
+
+test("single-repository writes do not erase a concurrent mode change", (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows does not expose POSIX mode changes consistently");
+    return;
+  }
+
+  const root = tempDir("mode-race");
+  const env = testEnv(root);
+  const repoRoot = path.join(root, "repo");
+  initGitRepo(repoRoot);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  addProfile("base", templatePath, env);
+  initRepository("base", { cwd: repoRoot, env });
+
+  const filePath = path.join(fs.realpathSync(repoRoot), ".gitignore");
+  fs.chmodSync(filePath, 0o640);
+  const before = fs.readFileSync(filePath);
+  fs.writeFileSync(templatePath, "*.tmp\n*.cache\n");
+
+  const originalFsyncSync = fs.fsyncSync;
+  let modeChanged = false;
+  fs.fsyncSync = function patchedFsyncSync(descriptor) {
+    const result = Reflect.apply(originalFsyncSync, fs, [descriptor]);
+    if (!modeChanged) {
+      fs.chmodSync(filePath, 0o600);
+      modeChanged = true;
+    }
+    return result;
+  };
+
+  try {
+    assert.throws(
+      () => syncRepository({ cwd: repoRoot, env }),
+      /destination mode or existence changed during atomic write/
+    );
+  } finally {
+    fs.fsyncSync = originalFsyncSync;
+  }
+
+  assert.equal(modeChanged, true);
+  assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
+  assert.deepEqual(fs.readFileSync(filePath), before);
+});
+
+test("init does not recreate a repository moved after planning", () => {
+  const root = tempDir("repository-move-race");
+  const env = testEnv(root);
+  const repoRoot = path.join(root, "repo");
+  const movedRepo = path.join(root, "repo-moved");
+  initGitRepo(repoRoot);
+  const realRepoRoot = fs.realpathSync(repoRoot);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  addProfile("base", templatePath, env);
+
+  const originalReadFileSync = fs.readFileSync;
+  let moved = false;
+  fs.readFileSync = function patchedReadFileSync(target, ...args) {
+    const content = Reflect.apply(originalReadFileSync, fs, [target, ...args]);
+    if (!moved && target === templatePath) {
+      fs.renameSync(realRepoRoot, movedRepo);
+      moved = true;
+    }
+    return content;
+  };
+
+  try {
+    assert.throws(
+      () => initRepository("base", { cwd: repoRoot, env }),
+      /repository changed during planning/
+    );
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  assert.equal(moved, true);
+  assert.equal(fs.existsSync(realRepoRoot), false);
+  assert.equal(fs.existsSync(path.join(realRepoRoot, ".gitignore")), false);
+  assert.equal(fs.existsSync(path.join(movedRepo, ".git")), true);
+});
+
+test("init revalidates Git metadata before writing", () => {
+  const root = tempDir("git-metadata-race");
+  const env = testEnv(root);
+  const repoRoot = path.join(root, "repo");
+  initGitRepo(repoRoot);
+  const realRepoRoot = fs.realpathSync(repoRoot);
+  const gitEntry = path.join(realRepoRoot, ".git");
+  const movedGitEntry = path.join(realRepoRoot, ".git-moved");
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  addProfile("base", templatePath, env);
+
+  const originalReadFileSync = fs.readFileSync;
+  let metadataMoved = false;
+  fs.readFileSync = function patchedReadFileSync(target, ...args) {
+    const content = Reflect.apply(originalReadFileSync, fs, [target, ...args]);
+    if (!metadataMoved && target === templatePath) {
+      fs.renameSync(gitEntry, movedGitEntry);
+      metadataMoved = true;
+    }
+    return content;
+  };
+
+  try {
+    assert.throws(
+      () => initRepository("base", { cwd: repoRoot, env }),
+      /repository changed during planning/
+    );
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  assert.equal(metadataMoved, true);
+  assert.equal(fs.existsSync(path.join(realRepoRoot, ".gitignore")), false);
+  assert.equal(fs.existsSync(movedGitEntry), true);
 });
 
 test("malformed reserved marker prefixes are errors and init does not mutate", () => {
@@ -546,6 +860,28 @@ test("malformed reserved marker prefixes are errors and init does not mutate", (
     /invalid existing \.gitignore managed block/
   );
   assert.equal(fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8"), malformed);
+});
+
+test("init rejects a project .gitignore BOM that would stop its first rule matching", () => {
+  const root = tempDir("project-bom");
+  const env = testEnv(root);
+  const repoRoot = path.join(root, "repo");
+  initGitRepo(repoRoot);
+  addProfile("base", writeTemplate(root, "base.shared", ".cache/\n"), env);
+
+  const filePath = path.join(repoRoot, ".gitignore");
+  const original = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from("*.tmp\n")]);
+  fs.writeFileSync(filePath, original);
+  assert.equal(
+    execFileSync("git", ["check-ignore", "artifact.tmp"], { cwd: repoRoot, encoding: "utf8" }).trim(),
+    "artifact.tmp"
+  );
+
+  assert.throws(
+    () => initRepository("base", { cwd: repoRoot, env }),
+    /unmanaged \.gitignore with a UTF-8 byte-order mark/
+  );
+  assert.deepEqual(fs.readFileSync(filePath), original);
 });
 
 test("init and sync dry runs report changes without writing", () => {
@@ -678,6 +1014,56 @@ test("sync-all completes preflight and aborts all writes when any repo is invali
   assert.match(failure.stdout.toString(), /not-updated\tbase\t/);
   assert.match(failure.stdout.toString(), /aborted\t.*no repositories updated/);
   assert.deepEqual(fs.readFileSync(path.join(goodRepo, ".gitignore")), beforeGood);
+});
+
+test("sync-all rechecks each repository immediately before its write", () => {
+  const root = tempDir("batch-write-race");
+  const env = testEnv(root);
+  const templatePath = writeTemplate(root, "base.shared", "*.tmp\n");
+  addProfile("base", templatePath, env);
+
+  const firstRepo = path.join(root, "a-first");
+  const secondRepo = path.join(root, "b-second");
+  initGitRepo(firstRepo);
+  initGitRepo(secondRepo);
+  initRepository("base", { cwd: firstRepo, env });
+  initRepository("base", { cwd: secondRepo, env });
+  fs.writeFileSync(templatePath, "*.tmp\n*.cache\n");
+
+  const firstGitignore = path.join(fs.realpathSync(firstRepo), ".gitignore");
+  const secondGitignore = path.join(fs.realpathSync(secondRepo), ".gitignore");
+  const secondBefore = fs.readFileSync(secondGitignore);
+  const concurrentEdit = Buffer.from("# concurrent project rule\n");
+  const originalRenameSync = fs.renameSync;
+  let editInjected = false;
+  fs.renameSync = function patchedRenameSync(source, destination) {
+    const result = Reflect.apply(originalRenameSync, fs, [source, destination]);
+    if (!editInjected && destination === firstGitignore) {
+      editInjected = true;
+      fs.appendFileSync(secondGitignore, concurrentEdit);
+    }
+    return result;
+  };
+
+  let batch;
+  try {
+    batch = syncAllRepositories({ root, env });
+  } finally {
+    fs.renameSync = originalRenameSync;
+  }
+
+  assert.equal(editInjected, true);
+  assert.equal(batch.aborted, true);
+  assert.equal(batch.appliedCount, 1);
+  assert.equal(batch.results.find((result) => result.repoRoot === fs.realpathSync(firstRepo)).applied, true);
+  assert.match(
+    batch.results.find((result) => result.repoRoot === fs.realpathSync(secondRepo)).errors.join("\n"),
+    /\.gitignore changed during batch update/
+  );
+  assert.deepEqual(
+    fs.readFileSync(secondGitignore),
+    Buffer.concat([secondBefore, concurrentEdit])
+  );
 });
 
 test("sync-all aborts mutation when discovery reports an unreadable subtree", (t) => {

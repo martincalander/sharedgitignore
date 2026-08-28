@@ -1,13 +1,19 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { validateTemplateContent } from "./block.js";
 import {
+  ensureDir,
   PROFILE_ID_PATTERN,
   REGISTRY_VERSION,
   readJsonFile,
   registryPath,
   writeJsonFile
 } from "./paths.js";
+
+const REGISTRY_LOCK_TIMEOUT_MS = 5_000;
+const REGISTRY_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
 
 export function validateProfileId(id) {
   if (typeof id !== "string" || !PROFILE_ID_PATTERN.test(id)) {
@@ -21,6 +27,168 @@ function emptyRegistry() {
     version: REGISTRY_VERSION,
     profiles: Object.create(null)
   };
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function lockPath(env) {
+  return `${registryPath(env)}.lock`;
+}
+
+function lockMetadata() {
+  return {
+    version: 1,
+    pid: process.pid,
+    hostname: os.hostname(),
+    createdAt: new Date().toISOString(),
+    token: crypto.randomBytes(16).toString("hex")
+  };
+}
+
+function closeQuietly(descriptor) {
+  try {
+    fs.closeSync(descriptor);
+  } catch {
+    // Preserve the operation that caused cleanup.
+  }
+}
+
+function createRegistryLock(filePath) {
+  let descriptor = null;
+  let stat = null;
+  try {
+    descriptor = fs.openSync(filePath, "wx", 0o600);
+    stat = fs.fstatSync(descriptor, { bigint: true });
+    const metadata = lockMetadata();
+    const content = `${JSON.stringify(metadata)}\n`;
+    fs.writeFileSync(descriptor, content);
+    fs.fsyncSync(descriptor);
+    return { descriptor, filePath, stat, token: metadata.token };
+  } catch (error) {
+    if (descriptor !== null) {
+      closeQuietly(descriptor);
+      if (stat !== null) {
+        try {
+          const current = fs.lstatSync(filePath, { bigint: true });
+          if (sameFileIdentity(current, stat)) fs.unlinkSync(filePath);
+        } catch {
+          // Preserve the lock creation error.
+        }
+      }
+    }
+    throw error;
+  }
+}
+
+function readLockSnapshot(filePath) {
+  let pathStat;
+  try {
+    pathStat = fs.lstatSync(filePath, { bigint: true });
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (pathStat.isSymbolicLink()) throw new Error(`refusing symbolic-link registry lock: ${filePath}`);
+  if (!pathStat.isFile()) throw new Error(`refusing non-file registry lock: ${filePath}`);
+
+  let descriptor = null;
+  try {
+    descriptor = fs.openSync(filePath, "r");
+    const descriptorStat = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameFileIdentity(pathStat, descriptorStat)) return null;
+    const content = fs.readFileSync(descriptor, "utf8");
+    let metadata = null;
+    try {
+      metadata = JSON.parse(content);
+    } catch {
+      // A new owner may not have finished writing its metadata yet.
+    }
+    return { stat: descriptorStat, metadata };
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") return null;
+    throw error;
+  } finally {
+    if (descriptor !== null) closeQuietly(descriptor);
+  }
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ESRCH") return false;
+    return true;
+  }
+}
+
+function waitForRegistryLock() {
+  Atomics.wait(REGISTRY_LOCK_WAIT, 0, 0, 10 + crypto.randomInt(11));
+}
+
+function registryLockTimeoutMessage(filePath, snapshot) {
+  const metadata = snapshot?.metadata;
+  if (metadata
+    && metadata.hostname === os.hostname()
+    && Number.isSafeInteger(metadata.pid)
+    && metadata.pid > 0
+    && !processIsAlive(metadata.pid)) {
+    return `registry lock was left by terminated process ${metadata.pid}: ${filePath}; remove it after verifying no profile command is running`;
+  }
+  return `timed out waiting for registry lock: ${filePath}`;
+}
+
+function acquireRegistryLock(env) {
+  const filePath = lockPath(env);
+  ensureDir(path.dirname(filePath));
+  const deadline = Date.now() + REGISTRY_LOCK_TIMEOUT_MS;
+
+  while (true) {
+    try {
+      return createRegistryLock(filePath);
+    } catch (error) {
+      if (!error || typeof error !== "object" || error.code !== "EEXIST") throw error;
+    }
+
+    if (Date.now() >= deadline) {
+      const snapshot = readLockSnapshot(filePath);
+      if (snapshot === null) continue;
+      throw new Error(registryLockTimeoutMessage(filePath, snapshot));
+    }
+    waitForRegistryLock();
+  }
+}
+
+function releaseRegistryLock(lock) {
+  fs.closeSync(lock.descriptor);
+  const current = readLockSnapshot(lock.filePath);
+  if (!current
+    || !sameFileIdentity(current.stat, lock.stat)
+    || current.metadata?.token !== lock.token) {
+    throw new Error(`registry lock changed while held: ${lock.filePath}`);
+  }
+  fs.unlinkSync(lock.filePath);
+}
+
+function withRegistryLock(env, operation) {
+  const lock = acquireRegistryLock(env);
+  let result;
+  let operationError = null;
+  try {
+    result = operation();
+  } catch (error) {
+    operationError = error;
+  }
+
+  try {
+    releaseRegistryLock(lock);
+  } catch (releaseError) {
+    if (operationError === null) throw releaseError;
+  }
+  if (operationError !== null) throw operationError;
+  return result;
 }
 
 function assertRegistryShape(registry) {
@@ -84,8 +252,13 @@ export function readRegistry(env = process.env) {
   return normalizeRegistry(readJsonFile(filePath));
 }
 
-export function writeRegistry(registry, env = process.env) {
+function writeRegistryUnlocked(registry, env) {
   writeJsonFile(registryPath(env), normalizeRegistry(registry));
+}
+
+export function writeRegistry(registry, env = process.env) {
+  const normalized = normalizeRegistry(registry);
+  withRegistryLock(env, () => writeRegistryUnlocked(normalized, env));
 }
 
 function inspectTemplateFile(filePath) {
@@ -103,8 +276,13 @@ function inspectTemplateFile(filePath) {
   try {
     stat = fs.statSync(filePath);
     if (!stat.isFile()) errors.push("template path is not a file");
-  } catch {
-    errors.push("template file does not exist");
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") {
+      errors.push("template file does not exist");
+    } else {
+      const code = error && typeof error === "object" && error.code ? ` (${error.code})` : "";
+      errors.push(`cannot inspect template file${code}`);
+    }
   }
 
   if (!stat?.isFile()) {
@@ -113,10 +291,10 @@ function inspectTemplateFile(filePath) {
 
   let bytes;
   try {
-    fs.accessSync(filePath, fs.constants.R_OK);
     bytes = fs.readFileSync(filePath);
-  } catch {
-    errors.push("template file is not readable");
+  } catch (error) {
+    const code = error && typeof error === "object" && error.code ? ` (${error.code})` : "";
+    errors.push(`template file is not readable${code}`);
     return { valid: false, errors, bytes: null, content: null };
   }
 
@@ -157,22 +335,30 @@ export function addProfile(id, filePath, env = process.env) {
     throw new Error(`invalid template for ${profileId}: ${validation.errors.join("; ")}`);
   }
 
-  const registry = readRegistry(env);
-  registry.profiles[profileId] = { path: resolvedPath };
-  writeRegistry(registry, env);
-  return {
-    id: profileId,
-    path: resolvedPath
-  };
+  return withRegistryLock(env, () => {
+    const currentValidation = validateTemplateFile(resolvedPath);
+    if (!currentValidation.valid) {
+      throw new Error(`invalid template for ${profileId}: ${currentValidation.errors.join("; ")}`);
+    }
+    const registry = readRegistry(env);
+    registry.profiles[profileId] = { path: resolvedPath };
+    writeRegistryUnlocked(registry, env);
+    return {
+      id: profileId,
+      path: resolvedPath
+    };
+  });
 }
 
 export function removeProfile(id, env = process.env) {
   const profileId = validateProfileId(id);
-  const registry = readRegistry(env);
-  const existed = Object.prototype.hasOwnProperty.call(registry.profiles, profileId);
-  delete registry.profiles[profileId];
-  writeRegistry(registry, env);
-  return existed;
+  return withRegistryLock(env, () => {
+    const registry = readRegistry(env);
+    const existed = Object.prototype.hasOwnProperty.call(registry.profiles, profileId);
+    delete registry.profiles[profileId];
+    writeRegistryUnlocked(registry, env);
+    return existed;
+  });
 }
 
 export function getProfile(id, env = process.env) {

@@ -32,12 +32,50 @@ function readGitignore(filePath) {
   return { exists: true, content: fs.readFileSync(filePath) };
 }
 
-function writeGitignore(filePath, content) {
-  atomicWriteFile(filePath, content);
+function writeGitignore(filePath, content, beforeRename) {
+  atomicWriteFile(filePath, content, { beforeRename, createParent: false });
 }
 
 function buffersEqual(left, right) {
   return Buffer.isBuffer(left) && Buffer.isBuffer(right) && left.equals(right);
+}
+
+function normalizeManagedLineEndings(content) {
+  return Buffer.from(content.toString("latin1").replaceAll("\r\n", "\n"), "latin1");
+}
+
+function managedGitignoreEqual(actual, expected, projectContent) {
+  if (!Buffer.isBuffer(actual) || !Buffer.isBuffer(expected) || !Buffer.isBuffer(projectContent)) return false;
+  if (actual.length < projectContent.length || expected.length < projectContent.length) return false;
+
+  const actualManagedEnd = actual.length - projectContent.length;
+  const expectedManagedEnd = expected.length - projectContent.length;
+  if (!actual.subarray(actualManagedEnd).equals(projectContent)) return false;
+  if (!expected.subarray(expectedManagedEnd).equals(projectContent)) return false;
+  return normalizeManagedLineEndings(actual.subarray(0, actualManagedEnd))
+    .equals(normalizeManagedLineEndings(expected.subarray(0, expectedManagedEnd)));
+}
+
+function repositoryIdentity(repoRoot) {
+  const rootStat = fs.statSync(repoRoot, { bigint: true });
+  if (!rootStat.isDirectory()) throw new Error(`repository root is not a directory: ${repoRoot}`);
+  const gitEntryStat = fs.lstatSync(path.join(repoRoot, ".git"), { bigint: true });
+  return {
+    root: { dev: rootStat.dev, ino: rootStat.ino },
+    gitEntry: { dev: gitEntryStat.dev, ino: gitEntryStat.ino }
+  };
+}
+
+function sameIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameRepositoryIdentity(left, right) {
+  return sameIdentity(left.root, right.root) && sameIdentity(left.gitEntry, right.gitEntry);
+}
+
+function startsWithUtf8Bom(content) {
+  return content.length >= 3 && content[0] === 0xef && content[1] === 0xbb && content[2] === 0xbf;
 }
 
 function assertTemplateIsNotDestination(templatePath, filePath, destinationExists) {
@@ -83,7 +121,7 @@ function detectManagedGitignore(repoRoot, env) {
       templatePath = template.path;
       assertTemplateIsNotDestination(template.path, filePath, gitignore.exists);
       expected = renderPlan(parsed.profile, template, parsed.projectContent);
-      inSync = expected.equals(gitignore.content);
+      inSync = managedGitignoreEqual(gitignore.content, expected, parsed.projectContent);
     } catch (error) {
       errors.push(errorMessage(error));
     }
@@ -126,10 +164,14 @@ function invalidExistingBlockMessage(errors) {
 
 function initPlan(profile, { cwd = process.cwd(), env = process.env } = {}) {
   const repoRoot = repoRootForCwd(cwd);
+  const repoIdentity = repositoryIdentity(repoRoot);
   const filePath = gitignorePath(repoRoot);
   const gitignore = readGitignore(filePath);
   const parsed = parseGitignore(gitignore.content);
   if (parsed.errors.length > 0) throw new Error(invalidExistingBlockMessage(parsed.errors));
+  if (!parsed.hasBlock && startsWithUtf8Bom(gitignore.content)) {
+    throw new Error("cannot initialize an unmanaged .gitignore with a UTF-8 byte-order mark; remove the BOM first");
+  }
 
   const template = readProfileTemplate(profile, env);
   assertTemplateIsNotDestination(template.path, filePath, gitignore.exists);
@@ -146,6 +188,7 @@ function initPlan(profile, { cwd = process.cwd(), env = process.env } = {}) {
   const nextContent = renderPlan(profile, template, projectContent);
   return {
     repoRoot,
+    repoIdentity,
     gitignorePath: filePath,
     profile,
     templatePath: template.path,
@@ -153,12 +196,15 @@ function initPlan(profile, { cwd = process.cwd(), env = process.env } = {}) {
     originalExists: gitignore.exists,
     originalContent: gitignore.content,
     nextContent,
-    changed: !nextContent.equals(gitignore.content)
+    changed: parsed.hasBlock
+      ? !managedGitignoreEqual(gitignore.content, nextContent, parsed.projectContent)
+      : !nextContent.equals(gitignore.content)
   };
 }
 
 function syncPlan({ cwd = process.cwd(), env = process.env } = {}) {
   const repoRoot = repoRootForCwd(cwd);
+  const repoIdentity = repositoryIdentity(repoRoot);
   const filePath = gitignorePath(repoRoot);
   const gitignore = readGitignore(filePath);
   const parsed = parseGitignore(gitignore.content);
@@ -171,6 +217,7 @@ function syncPlan({ cwd = process.cwd(), env = process.env } = {}) {
   const nextContent = renderPlan(parsed.profile, template, parsed.projectContent);
   return {
     repoRoot,
+    repoIdentity,
     gitignorePath: filePath,
     profile: parsed.profile,
     templatePath: template.path,
@@ -178,7 +225,7 @@ function syncPlan({ cwd = process.cwd(), env = process.env } = {}) {
     originalExists: gitignore.exists,
     originalContent: gitignore.content,
     nextContent,
-    changed: !nextContent.equals(gitignore.content)
+    changed: !managedGitignoreEqual(gitignore.content, nextContent, parsed.projectContent)
   };
 }
 
@@ -194,23 +241,49 @@ function publicPlanResult(plan, { dryRun, applied }) {
   };
 }
 
-function applyPlan(plan) {
+function revalidatePlan(plan, env, phase) {
+  let currentRepoIdentity;
+  try {
+    const currentRepoRoot = repoRootForCwd(plan.repoRoot);
+    if (currentRepoRoot !== plan.repoRoot) throw new Error(`Git repository root changed to: ${currentRepoRoot}`);
+    currentRepoIdentity = repositoryIdentity(plan.repoRoot);
+  } catch (error) {
+    throw new Error(`repository changed during ${phase}: ${errorMessage(error)}`);
+  }
+  if (!sameRepositoryIdentity(currentRepoIdentity, plan.repoIdentity)) {
+    throw new Error(`repository changed during ${phase}`);
+  }
+
   const current = readGitignore(plan.gitignorePath);
   if (current.exists !== plan.originalExists || !current.content.equals(plan.originalContent)) {
-    throw new Error(".gitignore changed during planning");
+    throw new Error(`.gitignore changed during ${phase}`);
   }
-  writeGitignore(plan.gitignorePath, plan.nextContent);
+
+  const template = readProfileTemplate(plan.profile, env);
+  if (template.path !== plan.templatePath || !template.bytes.equals(plan.templateContent)) {
+    throw new Error(`template changed during ${phase}`);
+  }
+  assertTemplateIsNotDestination(template.path, plan.gitignorePath, current.exists);
+}
+
+function applyPlan(plan, env, phase = "planning") {
+  revalidatePlan(plan, env, phase);
+  writeGitignore(
+    plan.gitignorePath,
+    plan.nextContent,
+    () => revalidatePlan(plan, env, `${phase} commit`)
+  );
 }
 
 export function initRepository(profile, { cwd = process.cwd(), env = process.env, dryRun = false } = {}) {
   const plan = initPlan(profile, { cwd, env });
-  if (plan.changed && !dryRun) applyPlan(plan);
+  if (plan.changed && !dryRun) applyPlan(plan, env);
   return publicPlanResult(plan, { dryRun, applied: plan.changed && !dryRun });
 }
 
 export function syncRepository({ cwd = process.cwd(), env = process.env, dryRun = false } = {}) {
   const plan = syncPlan({ cwd, env });
-  if (plan.changed && !dryRun) applyPlan(plan);
+  if (plan.changed && !dryRun) applyPlan(plan, env);
   return publicPlanResult(plan, { dryRun, applied: plan.changed && !dryRun });
 }
 
@@ -345,15 +418,7 @@ function preflightSyncRepositories(discovery, env, dryRun) {
 function revalidatePlans(plans, env) {
   for (const { plan, result } of plans) {
     try {
-      const current = readGitignore(plan.gitignorePath);
-      if (current.exists !== plan.originalExists || !current.content.equals(plan.originalContent)) {
-        throw new Error(".gitignore changed during batch preflight");
-      }
-      const template = readProfileTemplate(plan.profile, env);
-      if (template.path !== plan.templatePath || !template.bytes.equals(plan.templateContent)) {
-        throw new Error("template changed during batch preflight");
-      }
-      assertTemplateIsNotDestination(template.path, plan.gitignorePath, current.exists);
+      revalidatePlan(plan, env, "batch preflight");
     } catch (error) {
       result.errors.push(errorMessage(error));
     }
@@ -374,7 +439,7 @@ export function syncAllRepositories({ root, recursive = true, env = process.env,
     for (const { plan, result } of plans) {
       if (!plan.changed) continue;
       try {
-        writeGitignore(plan.gitignorePath, plan.nextContent);
+        applyPlan(plan, env, "batch update");
         result.applied = true;
       } catch (error) {
         result.errors.push(errorMessage(error));
